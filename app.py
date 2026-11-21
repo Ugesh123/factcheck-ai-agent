@@ -1,14 +1,112 @@
-"""Fact-Check Agent — Streamlit entry point.
+"""Fact-Check Agent: Streamlit entry point.
 
-Step 1 skeleton: upload a PDF, extract its text, and show a page summary.
-Claim extraction and live verification are added in later steps.
+Upload a PDF -> extract checkable claims -> search the live web for each
+claim -> label it Verified, Inaccurate or False, with the correct fact and
+sources. Layout uses containers only (no st.dataframe / st.table).
 """
+
+import csv
+import hashlib
+import io
 
 import streamlit as st
 
+from factcheck.claims import MAX_CLAIMS, build_batches, extract_from_batch, finalise_claims
+from factcheck.config import ConfigError, llm_api_key, llm_models, tavily_api_key
+from factcheck.llm import LLMError, make_client
 from factcheck.pdf_reader import MAX_FILE_MB, MAX_PAGES, PDFReadError, read_pdf
+from factcheck.search import SearchError, gather_evidence
+from factcheck.verify import (
+    NOT_CHECKED,
+    VERIFY_BATCH_SIZE,
+    build_payload,
+    finalise_results,
+    make_batches,
+    today_string,
+    verify_batch,
+)
 
 st.set_page_config(page_title="Fact-Check Agent", layout="wide")
+
+VERDICT_STYLE = {
+    "Verified": ":green[**Verified**]",
+    "Inaccurate": ":orange[**Inaccurate**]",
+    "False": ":red[**False**]",
+    "Unverified": ":gray[**Unverified**]",
+    NOT_CHECKED: ":gray[**Not checked**]",
+}
+
+VERDICT_ORDER = [
+    "False", "Inaccurate", "Unverified", NOT_CHECKED, "Verified"
+]
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def cached_extract(batch_text: str, models: tuple[str, ...]) -> list[dict]:
+    """One LLM call per batch, cached so re-running the same PDF costs nothing.
+
+    Errors are not cached by Streamlit, so a failed batch is retried next time.
+    """
+    client = make_client(llm_api_key())
+    return extract_from_batch(client, list(models), batch_text)
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def cached_verify(payload: str, models: tuple[str, ...], today: str) -> list[dict]:
+    """One LLM call per batch of claims, cached on the exact claims + evidence."""
+    client = make_client(llm_api_key())
+    return verify_batch(client, list(models), payload, today)
+
+
+def md(text: str) -> str:
+    """Escape text for st.markdown ($ would otherwise start a maths formula)."""
+    return str(text).replace("\\", "\\\\").replace("$", "\\$").replace("[", "\\[").replace("]", "\\]")
+
+
+def results_csv(results: list[dict]) -> str:
+    fields = ["id", "page", "claim", "quote", "verdict", "reason_label", "correct_fact",
+              "explanation", "confidence", "sources"]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for r in results:
+        writer.writerow({**r, "sources": " | ".join(s["url"] for s in r["sources"])})
+    return buffer.getvalue()
+
+
+def show_result(r: dict):
+    with st.container(border=True):
+        st.markdown(f"{VERDICT_STYLE[r['verdict']]} · {r['reason_label']}")
+        meta = f"{r['id']} · page {r['page'] or '?'}"
+        if r["confidence"]:
+            meta += f" · {r['confidence']} confidence"
+        st.caption(meta)
+
+        st.markdown(f"**Claim:** {md(r['claim'])}")
+        st.caption(f"In the document: “{md(r['quote'])}”")
+
+        if r["correct_fact"]:
+            st.markdown(f"**Correct fact:** :green[{md(r['correct_fact'])}]")
+        if r["explanation"]:
+            st.markdown(md(r["explanation"]))
+
+        if r["sources"]:
+            links = []
+            for s in r["sources"]:
+                date = f" · {s['published_date'][:10]}" if s.get("published_date") else ""
+                links.append(f"- [{md(s['title'])}]({s['url']}) · {s['domain']}{date}")
+            st.markdown("**Sources**\n" + "\n".join(links))
+
+
+def claims_to_csv(claims: list[dict]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(claims[0].keys()))
+    writer.writeheader()
+    writer.writerows(claims)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------- header
 
 st.title("Fact-Check Agent")
 st.caption(
@@ -25,11 +123,22 @@ if uploaded is None:
     st.info("Upload a PDF to begin.")
     st.stop()
 
+file_bytes = uploaded.getvalue()
+file_id = hashlib.sha256(file_bytes).hexdigest()
+
+# A new file clears the previous file's results.
+if st.session_state.get("file_id") != file_id:
+    st.session_state["file_id"] = file_id
+    for key in ("claims", "claim_warnings", "results", "verify_warnings"):
+        st.session_state.pop(key, None)
+
 try:
-    doc = read_pdf(uploaded.getvalue())
+    doc = read_pdf(file_bytes)
 except PDFReadError as err:
     st.error(str(err))
     st.stop()
+
+# ---------------------------------------------------------------- document summary
 
 col1, col2, col3 = st.columns(3)
 col1.metric("Pages", doc.page_count)
@@ -47,3 +156,185 @@ with st.expander("Preview extracted text"):
         if page.text.strip():
             st.markdown(f"**Page {page.number}**")
             st.text(page.text[:1500] + ("…" if len(page.text) > 1500 else ""))
+
+# ---------------------------------------------------------------- claim extraction
+
+st.divider()
+st.subheader("1. Extract claims")
+
+if st.button("Extract claims", type="primary"):
+    try:
+        llm_api_key()
+        models = tuple(llm_models())
+    except ConfigError as err:
+        st.error(str(err))
+        st.stop()
+
+    batches = build_batches(doc)
+    
+    raw_claims: list[dict] = []
+    warnings: list[str] = []
+    progress = st.progress(0.0, text="Reading the document…")
+
+    for i, batch in enumerate(batches, start=1):
+        progress.progress((i - 1) / len(batches), text=f"Extracting claims from {batch.label}…")
+        try:
+            raw_claims.extend(cached_extract(batch.text, models))
+            
+        except LLMError as err:
+            if err.fatal:
+                progress.empty()
+                st.error(str(err))
+                st.stop()
+            warnings.append(f"Skipped {batch.label}: {err}")
+
+    progress.empty()
+    claims = finalise_claims(raw_claims, doc)
+    st.session_state["claims"] = [c.to_dict() for c in claims]
+    st.session_state["claim_warnings"] = warnings
+    st.session_state.pop("results", None)  # new claims need a new check
+
+claims = st.session_state.get("claims")
+
+if claims is None:
+    st.caption(f"Finds up to {MAX_CLAIMS} checkable claims in the document.")
+    st.stop()
+
+for warning in st.session_state.get("claim_warnings", []):
+    st.warning(warning)
+
+if not claims:
+    st.info(
+        "No checkable factual claims were found. The document may contain only "
+        "opinions or general statements, with no specific numbers, dates or figures."
+    )
+    st.stop()
+
+st.success(f"Found {len(claims)} checkable claims.")
+
+unmatched = [c["id"] for c in claims if not c["quote_found"]]
+if unmatched:
+    st.caption(
+        f"The quote for {', '.join(unmatched)} couldn't be matched exactly to the "
+        "PDF text (often due to line breaks or special characters). Check these by hand."
+    )
+
+st.subheader("Extracted Claims")
+
+for c in claims:
+    with st.container(border=True):
+        st.markdown(f"**{c['id']} — {md(c['claim'])}**")
+        st.write(f"Page: {c['page'] or '?'}")
+        st.write(f"Type: {c['claim_type']}")
+        st.write(f"Value: {c['value']}")
+        st.write(f"Time reference: {c['time_reference']}")
+        st.write(f"Search query: {c['search_query']}")
+
+with st.expander("Exact quotes from the document"):
+    for c in claims:
+        st.markdown(f"**{c['id']}** · page {c['page'] or '?'}")
+        st.markdown(f"> {c['quote']}")
+
+st.download_button(
+    "Download claims (CSV)",
+    data=claims_to_csv(claims),
+    file_name="claims.csv",
+    mime="text/csv",
+)
+
+# ---------------------------------------------------------------- verification
+
+st.divider()
+st.subheader("2. Verify against the live web")
+
+if st.button("Verify claims", type="primary"):
+    try:
+        search_key = tavily_api_key()
+        llm_api_key()
+        models = tuple(llm_models())
+    except ConfigError as err:
+        st.error(str(err))
+        st.stop()
+
+    progress = st.progress(0.0, text="Searching the web…")
+
+    def on_search_progress(done, total):
+        progress.progress(0.6 * done / total, text=f"Searching the web… ({done}/{total} claims)")
+
+    try:
+        evidence, search_errors = gather_evidence(claims, search_key, on_search_progress)
+    except SearchError as err:
+        progress.empty()
+        st.error(str(err))
+        st.stop()
+
+    not_checked = dict(search_errors)
+    to_verify = [c for c in claims if c["id"] not in not_checked and evidence.get(c["id"])]
+    by_id = {c["id"]: c for c in to_verify}
+    verify_batches = make_batches([c["id"] for c in to_verify])
+    raw_results: list[dict] = []
+    warnings: list[str] = []
+    today = today_string()
+
+    for i, batch_ids in enumerate(verify_batches, start=1):
+        progress.progress(0.6 + 0.4 * (i - 1) / len(verify_batches),
+                          text=f"Checking claims against the evidence… (batch {i} of {len(verify_batches)})")
+        payload = build_payload([by_id[cid] for cid in batch_ids], evidence)
+        try:
+            raw_results.extend(cached_verify(payload, models, today))
+        except LLMError as err:
+            remaining = [cid for b in verify_batches[i - 1:] for cid in b] if err.fatal else batch_ids
+            for cid in remaining:
+                not_checked[cid] = str(err)
+            warnings.append(str(err))
+            if err.fatal:
+                break
+
+    progress.empty()
+    st.session_state["results"] = finalise_results(claims, evidence, raw_results, not_checked)
+    st.session_state["verify_warnings"] = warnings
+
+results = st.session_state.get("results")
+
+if results is None:
+    st.caption(
+        f"Searches the web for each claim and checks up to {VERIFY_BATCH_SIZE} claims "
+        "per model request."
+    )
+    st.stop()
+
+for warning in st.session_state.get("verify_warnings", []):
+    st.warning(warning)
+
+counts = {v: sum(1 for r in results if r["verdict"] == v) for v in VERDICT_ORDER}
+
+m1, m2, m3, m4, m5 = st.columns(5)
+
+m1.metric("Verified", counts["Verified"])
+m2.metric("Inaccurate", counts["Inaccurate"])
+m3.metric("False", counts["False"])
+m4.metric("Unverified", counts["Unverified"])
+m5.metric("Not checked", counts[NOT_CHECKED])
+
+st.caption(
+    "**Verified** = supported by reliable sources. "
+    "**Inaccurate** = contradicted or outdated. "
+    "**Unverified** = insufficient public evidence to confirm or reject. "
+    "**Not checked** = verification could not complete."
+)
+
+choice = st.radio("Show", ["All"] + VERDICT_ORDER, horizontal=True)
+shown = [r for r in results if choice == "All" or r["verdict"] == choice]
+shown.sort(key=lambda r: (VERDICT_ORDER.index(r["verdict"]), r["id"]))
+
+if not shown:
+    st.caption("No claims in this category.")
+for r in shown:
+    show_result(r)
+
+st.download_button(
+    "Download report (CSV)",
+    data=results_csv(results),
+    file_name="fact_check_report.csv",
+    mime="text/csv",
+)
