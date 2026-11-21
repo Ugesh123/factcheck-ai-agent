@@ -20,7 +20,7 @@ If a search or model request fails, or the model gives a verdict without citing 
 
 ```
 PDF → text by page (PyMuPDF)
-    → claim extraction (LLM, structured JSON)
+    → claim extraction (LLM, structured JSON; skipped number-bearing sentences re-asked up to 2 times, then flagged)
     → live web search per claim (Tavily: the claim itself + a "latest figure" query)
     → verification in batches of 8 claims (LLM judges only from the retrieved sources)
     → report: verdict, correct fact, explanation, clickable sources, CSV export
@@ -75,7 +75,8 @@ On Streamlit Community Cloud, paste the same lines into **App settings → Secre
 
 ## Limitations
 
-- Free-tier limits: OpenRouter free models allow about 50 requests a day, and Tavily's free plan gives 1,000 searches a month. One PDF uses about 3 model requests and about 3 searches per claim. Results are cached, so re-running the same PDF costs nothing.
+- Free-tier limits: OpenRouter free models allow about 50 requests a day, and Tavily's free plan gives 1,000 searches a month. One PDF uses about 3 to 5 model requests and about 3 searches per claim. Complete results are cached, so re-running the same PDF costs nothing; an incomplete extraction is not cached.
+- `openrouter/free` sends each request to a random free model, so output quality varies between requests. The app checks every full sentence that contains a number against the extracted claims, re-asks about any it skipped, and shows a warning if any are still missing. To make it steadier, set `LLM_MODEL` to a comma-separated list of specific `:free` models (tried in order).
 - Up to 25 claims per PDF, 40 pages, 15 MB. Scanned (image-only) pages are skipped; there is no OCR.
 - A claim can be labelled False when it is true but poorly covered online. The app says so in each False result.
 - Free models vary in quality; the app falls back from strict JSON schemas to plain JSON mode when a free model doesn't support them.

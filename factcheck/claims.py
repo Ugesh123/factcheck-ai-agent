@@ -4,6 +4,12 @@ The document is split into batches of whole pages. Each batch is sent to the
 LLM with a strict JSON schema. The results are then cleaned up in code:
 quotes are checked against the real page text, duplicates are removed, and
 the list is ranked and capped at MAX_CLAIMS.
+
+Free models vary a lot from one request to the next, so the app doesn't
+trust a single reply. find_candidates() lists every full sentence in the PDF
+that contains a number; uncovered() shows which of them no claim came from.
+Those sentences are sent back once more (extract_missed), and anything still
+uncovered is reported to the user instead of being silently dropped.
 """
 
 from __future__ import annotations
@@ -167,7 +173,13 @@ def build_batches(doc: Document, char_limit: int = BATCH_CHAR_LIMIT) -> list[Bat
 
 # ---------------------------------------------------------------- LLM call
 
-def extract_from_batch(client: OpenAI, models: list[str], batch_text: str) -> list[dict]:
+def _claim_list(result: dict) -> list[dict]:
+    claims = result.get("claims", [])
+    return [c for c in claims if isinstance(c, dict)] if isinstance(claims, list) else []
+
+
+def extract_from_batch(client: OpenAI, models: list[str], batch_text: str,
+                       meta: dict | None = None) -> list[dict]:
     """Send one batch to the LLM and return the raw claim dicts."""
     result = structured_completion(
         client=client,
@@ -176,9 +188,112 @@ def extract_from_batch(client: OpenAI, models: list[str], batch_text: str) -> li
         user_prompt=f"Extract the checkable factual claims from this document text.\n\n{batch_text}",
         schema_name="claim_list",
         schema=CLAIM_SCHEMA,
+        temperature=0,
+        meta=meta,
     )
-    claims = result.get("claims", [])
-    return claims if isinstance(claims, list) else []
+    return _claim_list(result)
+
+
+def extract_missed(client: OpenAI, models: list[str], sentences: list[Candidate],
+                   meta: dict | None = None) -> list[dict]:
+    """Second pass: ask only about the sentences the first reply skipped."""
+    listing = "\n".join(f"[PAGE {c.page}] {c.text}" for c in sentences)
+    result = structured_completion(
+        client=client,
+        models=models,
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=(
+            "An earlier pass skipped the sentences below. Each one contains a number or a date. "
+            "Go through every sentence and extract each checkable factual claim it contains. "
+            "Leave out a sentence only if it has nothing that a web search could confirm or "
+            "disprove (for example the document's own date or a section number).\n\n" + listing
+        ),
+        schema_name="claim_list",
+        schema=CLAIM_SCHEMA,
+        temperature=0,
+        meta=meta,
+    )
+    return _claim_list(result)
+
+
+# ---------------------------------------------------------------- completeness check
+
+@dataclass
+class Candidate:
+    """A full sentence in the PDF that contains a number, so it probably holds a claim."""
+    page: int
+    text: str
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+_LIST_NUMBER = re.compile(r"^\(?\d{1,2}[.)]\s+")
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _numbers(text: str) -> set[str]:
+    return {n.replace(",", "") for n in _NUMBER.findall(text)}
+
+
+def _blocks(page_text: str) -> list[str]:
+    """Join wrapped lines back into paragraphs, keeping headings separate.
+
+    A short line with no closing punctuation, followed by a line that starts
+    with a capital or a digit, is treated as a heading rather than the start
+    of the next sentence.
+    """
+    lines = [l.strip() for l in page_text.replace("-\n", "").splitlines()]
+    blocks, current = [], []
+    for i, line in enumerate(lines):
+        if not line:
+            if current:
+                blocks.append(" ".join(current)); current = []
+            continue
+        current.append(line)
+        nxt = next((l for l in lines[i + 1:] if l), "")
+        heading = len(line) < 60 and line[-1] not in ".!?,;:" and (nxt[:1].isupper() or nxt[:1].isdigit())
+        if heading:
+            blocks.append(" ".join(current)); current = []
+    if current:
+        blocks.append(" ".join(current))
+    return blocks
+
+
+def find_candidates(doc: Document) -> list[Candidate]:
+    """Every full sentence (ending in . ! or ?) of 20+ characters with a digit in it.
+
+    Headings and table cells are left out: they rarely end in a full stop, and
+    this check is a safety net, not the extractor itself.
+    """
+    found: list[Candidate] = []
+    for page in doc.pages:
+        for block in _blocks(page.text):
+            flat = re.sub(r"\s+", " ", block).strip()
+            for sentence in _SENTENCE_END.split(flat):
+                sentence = _LIST_NUMBER.sub("", sentence.strip())
+                if len(sentence) >= 20 and sentence[-1] in ".!?" and _numbers(sentence):
+                    found.append(Candidate(page=page.number, text=sentence))
+    return found
+
+
+def _covers(claim: dict, sentence_norm: str, sentence_numbers: set[str]) -> bool:
+    quote = _normalise(str(claim.get("quote", "")))
+    if quote and (quote in sentence_norm or sentence_norm in quote
+                  or (len(quote) >= 40 and quote[:40] in sentence_norm)):
+        return True
+    # Quote paraphrased: accept if a figure and the entity both appear in the sentence.
+    entity = _normalise(str(claim.get("entity", "")))
+    figures = _numbers(f"{claim.get('value', '')} {claim.get('quote', '')}")
+    return bool(entity) and entity in sentence_norm and bool(figures & sentence_numbers)
+
+
+def uncovered(candidates: list[Candidate], claims: list[dict]) -> list[Candidate]:
+    """Candidate sentences that none of the claims were taken from."""
+    missing = []
+    for cand in candidates:
+        norm, nums = _normalise(cand.text), _numbers(cand.text)
+        if not any(_covers(c, norm, nums) for c in claims):
+            missing.append(cand)
+    return missing
 
 
 # ---------------------------------------------------------------- clean-up

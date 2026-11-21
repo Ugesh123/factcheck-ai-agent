@@ -11,7 +11,15 @@ import io
 
 import streamlit as st
 
-from factcheck.claims import MAX_CLAIMS, build_batches, extract_from_batch, finalise_claims
+from factcheck.claims import (
+    MAX_CLAIMS,
+    build_batches,
+    extract_from_batch,
+    extract_missed,
+    finalise_claims,
+    find_candidates,
+    uncovered,
+)
 from factcheck.config import ConfigError, llm_api_key, llm_models, tavily_api_key
 from factcheck.llm import LLMError, make_client
 from factcheck.pdf_reader import MAX_FILE_MB, MAX_PAGES, PDFReadError, read_pdf
@@ -38,14 +46,58 @@ VERDICT_STYLE = {
 VERDICT_ORDER = ["Inaccurate", "False", "Verified", NOT_CHECKED]
 
 
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
-def cached_extract(batch_text: str, models: tuple[str, ...]) -> list[dict]:
-    """One LLM call per batch, cached so re-running the same PDF costs nothing.
+MISSED_PASSES = 2  # extra requests per batch for sentences the first reply skipped
 
-    Errors are not cached by Streamlit, so a failed batch is retried next time.
+
+@st.cache_resource(ttl=24 * 3600)
+def complete_extractions() -> dict:
+    """Extraction results per batch, stored only once they passed the
+    completeness check. An incomplete reply is never cached, so the next run
+    asks again instead of repeating a bad result for 24 hours."""
+    return {}
+
+
+def extract_batch(client, models: tuple[str, ...], batch, candidates, log: list[dict]):
+    """Extract one batch, then re-ask about any number-bearing sentence it skipped.
+
+    Returns (raw claims, error message or None).
     """
-    client = make_client(llm_api_key())
-    return extract_from_batch(client, list(models), batch_text)
+    key = (hashlib.sha256(batch.text.encode()).hexdigest(), models)
+    store = complete_extractions()
+    if key in store:
+        log.append({"batch": batch.label, "pass": "saved result", "model": "-", "claims": len(store[key])})
+        return list(store[key]), None
+
+    found: list[dict] = []
+    error = None
+    passes = [("first pass", lambda m: extract_from_batch(client, list(models), batch.text, m))]
+    for n in range(1, MISSED_PASSES + 1):
+        passes.append((f"retry {n}", None))
+
+    for name, call in passes:
+        if call is None:
+            missing = uncovered(candidates, found)
+            if not missing:
+                break
+            call = lambda m, missing=missing: extract_missed(client, list(models), missing, m)
+        meta: dict = {}
+        try:
+            got = call(meta)
+        except LLMError as err:
+            if err.fatal:
+                raise
+            error = str(err)
+            log.append({"batch": batch.label, "pass": name, "model": meta.get("model", "?"),
+                        "claims": 0, "note": error})
+            continue
+        found.extend(got)
+        log.append({"batch": batch.label, "pass": name, "model": meta.get("model", "?"),
+                    "claims": len(got), "note": meta.get("mode", "")})
+
+    if found and not uncovered(candidates, found):
+        store[key] = list(found)
+        error = None  # a retry recovered what the failed request missed
+    return found, error
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
@@ -128,7 +180,8 @@ file_id = hashlib.sha256(file_bytes).hexdigest()
 # A new file clears the previous file's results.
 if st.session_state.get("file_id") != file_id:
     st.session_state["file_id"] = file_id
-    for key in ("claims", "claim_warnings", "results", "verify_warnings"):
+    for key in ("claims", "claim_warnings", "claim_missing", "claim_log", "claim_total",
+                "results", "verify_warnings"):
         st.session_state.pop(key, None)
 
 try:
@@ -170,27 +223,36 @@ if st.button("Extract claims", type="primary"):
         st.stop()
 
     batches = build_batches(doc)
-    
+    candidates = find_candidates(doc)
+    client = make_client(llm_api_key())
+
     raw_claims: list[dict] = []
     warnings: list[str] = []
+    log: list[dict] = []
     progress = st.progress(0.0, text="Reading the document…")
 
     for i, batch in enumerate(batches, start=1):
         progress.progress((i - 1) / len(batches), text=f"Extracting claims from {batch.label}…")
+        batch_candidates = [c for c in candidates if c.page in batch.pages]
         try:
-            raw_claims.extend(cached_extract(batch.text, models))
-            
-        except LLMError as err:
-            if err.fatal:
-                progress.empty()
-                st.error(str(err))
-                st.stop()
-            warnings.append(f"Skipped {batch.label}: {err}")
+            found, error = extract_batch(client, models, batch, batch_candidates, log)
+        except LLMError as err:  # fatal: bad key, daily limit, unknown model
+            progress.empty()
+            st.error(str(err))
+            st.stop()
+        raw_claims.extend(found)
+        if error:
+            warnings.append(f"Part of {batch.label} may be missing: {error}")
 
     progress.empty()
     claims = finalise_claims(raw_claims, doc)
+    total = len(finalise_claims(raw_claims, doc, limit=10**6))
+    missing = uncovered(candidates, raw_claims)
     st.session_state["claims"] = [c.to_dict() for c in claims]
     st.session_state["claim_warnings"] = warnings
+    st.session_state["claim_missing"] = [{"page": m.page, "text": m.text} for m in missing]
+    st.session_state["claim_log"] = log
+    st.session_state["claim_total"] = total
     st.session_state.pop("results", None)  # new claims need a new check
 
 claims = st.session_state.get("claims")
@@ -199,8 +261,26 @@ if claims is None:
     st.caption(f"Finds up to {MAX_CLAIMS} checkable claims in the document.")
     st.stop()
 
-for warning in st.session_state.get("claim_warnings", []):
+claim_warnings = st.session_state.get("claim_warnings", [])
+claim_missing = st.session_state.get("claim_missing", [])
+
+for warning in claim_warnings:
     st.warning(warning)
+
+if claim_missing:
+    lines = "\n".join(f"- Page {m['page']}: {md(m['text'])}" for m in claim_missing)
+    st.warning(
+        f"**Extraction may be incomplete.** {len(claim_missing)} sentence(s) in the PDF contain "
+        f"a number or date but no claim was extracted from them, even after "
+        f"{MISSED_PASSES} retries. Some may not be checkable facts (a document date, a "
+        f"section number); check the rest by hand or click Extract claims again.\n\n{lines}"
+    )
+
+if st.session_state.get("claim_log"):
+    with st.expander("Extraction details (which free model answered each request)"):
+        for row in st.session_state["claim_log"]:
+            note = f" · {row['note']}" if row.get("note") else ""
+            st.write(f"{row['batch']} · {row['pass']} · `{row['model']}` · {row['claims']} claims{note}")
 
 if not claims:
     st.info(
@@ -209,7 +289,16 @@ if not claims:
     )
     st.stop()
 
-st.success(f"Found {len(claims)} checkable claims.")
+if claim_missing or claim_warnings:
+    st.info(f"Showing the {len(claims)} claims that were extracted.")
+else:
+    st.success(f"Found {len(claims)} checkable claims.")
+
+if st.session_state.get("claim_total", 0) > len(claims):
+    st.info(
+        f"The document has {st.session_state['claim_total']} distinct claims; the "
+        f"{len(claims)} most important are shown (limit {MAX_CLAIMS})."
+    )
 
 unmatched = [c["id"] for c in claims if not c["quote_found"]]
 if unmatched:
