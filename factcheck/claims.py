@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from .pdf_reader import Document
 
-MAX_CLAIMS = 3
+MAX_CLAIMS = 25
 PER_BATCH_LIMIT = 15
 BATCH_CHAR_LIMIT = 12000
 

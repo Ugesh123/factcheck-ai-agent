@@ -9,11 +9,18 @@ assessment labels are always applied consistently:
     matches                 Verified
     outdated                Inaccurate   (correct fact required)
     contradicted            Inaccurate   (correct fact required)
-    not_supported           False        sources cover the topic, none support the claim
-    insufficient_evidence   False        too little relevant evidence to judge
+    not_supported           False        no evidence: sources cover the topic, none support the claim
+    insufficient_evidence   False        no evidence: too little relevant information online
+
+"False" follows the assessment's definition (no evidence found). It means
+no reliable source supports the claim, not that the claim was disproven;
+claims that sources actively contradict are labelled Inaccurate.
 
 The model cites sources by ID only. IDs are mapped back to URLs in code,
-so it can't cite a page that wasn't actually retrieved.
+so it can't cite a page that wasn't actually retrieved. A Verified or
+Inaccurate verdict that cites no retrieved source is not accepted: the claim
+is marked "uncited" so the app can retry it, and stays Not checked if the
+retry also fails. It is never turned into False.
 """
 
 from __future__ import annotations
@@ -34,16 +41,16 @@ REASON_TO_VERDICT = {
     "matches": "Verified",
     "outdated": "Inaccurate",
     "contradicted": "Inaccurate",
-    "not_supported": "Unverified",
-    "insufficient_evidence": "Unverified",
+    "not_supported": "False",
+    "insufficient_evidence": "False",
 }
 
 REASON_LABELS = {
     "matches": "Matches the sources",
     "outdated": "Outdated: newer data exists",
     "contradicted": "Contradicted by the sources",
-    "not_supported": "No evidence found: sources don't support it",
-    "insufficient_evidence": "No evidence found: too little information to judge",
+    "not_supported": "No reliable evidence found: sources on this topic don't support it",
+    "insufficient_evidence": "No reliable evidence found: little relevant information online",
 }
 
 NOT_CHECKED = "Not checked"
@@ -78,7 +85,7 @@ VERIFY_SCHEMA = {
     },
 }
 
-SYSTEM_PROMPT = """- not_supported: the sources discuss this topic but do not confirm the specific claim. This does NOT mean the claim is false..
+SYSTEM_PROMPT = """You are a careful fact-checker. Today's date is {today}.
 
 For each claim, judge it using ONLY the sources listed under that claim. Do not use your own knowledge to accept or reject a claim; it may be out of date.
 
@@ -86,11 +93,11 @@ Pick one reason per claim:
 - matches: a reliable source states the same fact. Allow rounding and approximate wording ("over 1 billion" matches 1.2 billion). A claim tied to a past date ("in 2023, X was Y") matches if it was true at that date, even if newer figures exist.
 - outdated: the figure was true at some point, but the sources show a newer one, and the claim presents the old figure as current (no date given, or words like "now", "currently", "today").
 - contradicted: the sources clearly state a different fact (a different number, date, name or detail).
-- not_supported: the sources discuss this topic, but none of them state or support this specific fact. This suggests the claim may be made up.
+- not_supported: the sources discuss this topic, but none of them state or support this specific fact. This means no evidence was found; it does not prove the claim is untrue.
 - insufficient_evidence: the sources are off-topic or too thin to judge either way.
 
 correct_fact: for outdated or contradicted, write the correct fact as the sources give it, with units and its date or period, e.g. "About 1.2 billion weekly users (September 2026)". For any other reason, use an empty string.
-explanation: one or two plain sentences on what the sources show.
+explanation: one or two plain sentences on what the sources show. For not_supported and insufficient_evidence, say what was searched for and that no reliable source confirms it; do not say the claim is disproven.
 source_ids: the IDs of the sources you relied on, exactly as written (e.g. "C03-S2"). For matches, outdated and contradicted, cite at least one. Never make up an ID.
 confidence: high if the sources are authoritative and agree; medium if they are secondary or slightly unclear; low if they conflict or are weak.
 
@@ -139,7 +146,7 @@ def verify_batch(client: OpenAI, models: list[str], payload: str, today: str) ->
 
 # ---------------------------------------------------------------- clean-up
 
-def _not_checked(claim: dict, note: str) -> dict:
+def _not_checked(claim: dict, note: str, uncited: bool = False) -> dict:
     return {
         **claim,
         "verdict": NOT_CHECKED,
@@ -149,6 +156,7 @@ def _not_checked(claim: dict, note: str) -> dict:
         "explanation": note,
         "sources": [],
         "confidence": "",
+        "uncited": uncited,
     }
 
 
@@ -156,11 +164,11 @@ def no_evidence_result(claim: dict) -> dict:
     """For claims where the search returned nothing: no LLM request needed."""
     return {
         **claim,
-        "verdict": "Unverified",
+        "verdict": "False",
         "reason": "insufficient_evidence",
         "reason_label": REASON_LABELS["insufficient_evidence"],
         "correct_fact": "",
-        "explanation": "The web search returned no relevant results for this claim.",
+        "explanation": "The live web search returned no relevant results, so no reliable evidence supports this claim. This does not prove it is untrue.",
         "sources": [],
         "confidence": "low",
     }
@@ -213,11 +221,15 @@ def finalise_results(
                 s = claim_sources[n - 1]
                 cited.append({"url": s.url, "title": s.title, "domain": s.domain, "published_date": s.published_date})
 
-        # A verdict that rests on evidence must cite some.
+        # A verdict that rests on evidence must cite some. Without a citation
+        # the verdict is rejected (not turned into False) so it can be retried.
         if reason in ("matches", "outdated", "contradicted") and not cited:
-            reason, confidence = "insufficient_evidence", "low"
-            explanation = (explanation + " (No retrieved source was cited, so this couldn't be confirmed.)").strip()
-            correct_fact = ""
+            final.append(_not_checked(
+                claim,
+                "The model gave a verdict without citing any retrieved source, so it was not accepted.",
+                uncited=True,
+            ))
+            continue
 
         if reason in ("matches", "not_supported", "insufficient_evidence"):
             correct_fact = ""

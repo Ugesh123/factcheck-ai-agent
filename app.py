@@ -32,13 +32,10 @@ VERDICT_STYLE = {
     "Verified": ":green[**Verified**]",
     "Inaccurate": ":orange[**Inaccurate**]",
     "False": ":red[**False**]",
-    "Unverified": ":gray[**Unverified**]",
     NOT_CHECKED: ":gray[**Not checked**]",
 }
 
-VERDICT_ORDER = [
-    "False", "Inaccurate", "Unverified", NOT_CHECKED, "Verified"
-]
+VERDICT_ORDER = ["Inaccurate", "False", "Verified", NOT_CHECKED]
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
@@ -89,6 +86,8 @@ def show_result(r: dict):
             st.markdown(f"**Correct fact:** :green[{md(r['correct_fact'])}]")
         if r["explanation"]:
             st.markdown(md(r["explanation"]))
+        if r["verdict"] == "False":
+            st.caption("No reliable evidence was found for this claim. That is not proof it is untrue.")
 
         if r["sources"]:
             links = []
@@ -290,8 +289,24 @@ if st.button("Verify claims", type="primary"):
             if err.fatal:
                 break
 
+    results = finalise_results(claims, evidence, raw_results, not_checked)
+
+    # Retry once, uncached, any claim whose verdict came back without a cited source.
+    retry_ids = [r["id"] for r in results if r.get("uncited")]
+    if retry_ids:
+        progress.progress(0.95, text=f"Re-checking {len(retry_ids)} claim(s) that came back without a source…")
+        try:
+            retry_raw = verify_batch(make_client(llm_api_key()), list(models),
+                                     build_payload([by_id[cid] for cid in retry_ids], evidence), today)
+            retry_set = set(retry_ids)
+            raw_results = [r for r in raw_results
+                           if not (isinstance(r, dict) and str(r.get("claim_id", "")).strip() in retry_set)] + retry_raw
+            results = finalise_results(claims, evidence, raw_results, not_checked)
+        except LLMError as err:
+            warnings.append(f"Retry of uncited claims failed: {err}")
+
     progress.empty()
-    st.session_state["results"] = finalise_results(claims, evidence, raw_results, not_checked)
+    st.session_state["results"] = results
     st.session_state["verify_warnings"] = warnings
 
 results = st.session_state.get("results")
@@ -308,22 +323,27 @@ for warning in st.session_state.get("verify_warnings", []):
 
 counts = {v: sum(1 for r in results if r["verdict"] == v) for v in VERDICT_ORDER}
 
-m1, m2, m3, m4, m5 = st.columns(5)
-
+m1, m2, m3 = st.columns(3)
 m1.metric("Verified", counts["Verified"])
 m2.metric("Inaccurate", counts["Inaccurate"])
 m3.metric("False", counts["False"])
-m4.metric("Unverified", counts["Unverified"])
-m5.metric("Not checked", counts[NOT_CHECKED])
 
 st.caption(
-    "**Verified** = supported by reliable sources. "
-    "**Inaccurate** = contradicted or outdated. "
-    "**Unverified** = insufficient public evidence to confirm or reject. "
-    "**Not checked** = verification could not complete."
+    "**Verified** = matches live web data. "
+    "**Inaccurate** = contradicted or outdated; the correct fact is shown. "
+    "**False** = no reliable evidence found. This means nothing online supports the claim, "
+    "not that it was proven wrong."
 )
 
-choice = st.radio("Show", ["All"] + VERDICT_ORDER, horizontal=True)
+if counts[NOT_CHECKED]:
+    st.warning(
+        f"{counts[NOT_CHECKED]} claim(s) could not be checked: a search or model request failed, "
+        "or the model gave a verdict without citing a source (already retried once). "
+        "They have no verdict; open each one under 'Not checked' for details."
+    )
+
+filters = ["All", "Inaccurate", "False", "Verified"] + ([NOT_CHECKED] if counts[NOT_CHECKED] else [])
+choice = st.radio("Show", filters, horizontal=True)
 shown = [r for r in results if choice == "All" or r["verdict"] == choice]
 shown.sort(key=lambda r: (VERDICT_ORDER.index(r["verdict"]), r["id"]))
 
